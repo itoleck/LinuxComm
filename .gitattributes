@@ -1,0 +1,4 @@
+# Keep Unix line endings so the scripts run on Linux even if checked out on Windows.
+* text=auto eol=lf
+*.svg text eol=lf
+*.png binary

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=LinuxComm
+GenericName=Clock, Weather & Intercom
+Comment=Clock and weather display with an intercom for your local network
+Exec=linuxcomm
+Icon=io.github.itoleck.LinuxComm
+Terminal=false
+Categories=Network;AudioVideo;Audio;Utility;GTK;
+Keywords=intercom;clock;weather;talk;announce;
+StartupNotify=true
+X-GNOME-UsesNotifications=true
