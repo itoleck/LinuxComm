@@ -28,6 +28,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(self.config_with({"transcript_folder": "/media/usb/transcripts"}).get("transcript_folder"),
                          "/media/usb/transcripts")
 
+    def test_text_color(self):
+        self.assertEqual(self.config_with({}).get("text_color"), "#000000")                 # black by default
+        self.assertEqual(self.config_with({"text_color": "#FFF"}).get("text_color"), "#ffffff")
+        self.assertEqual(self.config_with({"text_color": "red"}).get("text_color"), "#000000")  # not hex
+        # Settings from before the text color existed keep light text on the dark theme...
+        self.assertEqual(self.config_with({"theme": "soft-dark"}).get("text_color"), "#ffffff")
+        # ...but a color chosen for it is kept.
+        self.assertEqual(self.config_with({"theme": "soft-dark", "text_color": "#000000"}).get("text_color"),
+                         "#000000")
+
     def test_defaults_and_unknown_keys(self):
         config = self.config_with({"station_name": "Kitchen", "no_such_setting": 1})
         self.assertEqual(config.station_name, "Kitchen")

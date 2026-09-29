@@ -5,7 +5,8 @@
 #   sudo bash install_arch.sh --autostart                ...and start LinuxComm when anyone logs in
 #   sudo bash install_arch.sh --autostart --fullscreen   ...fullscreen, for wall-mounted displays
 #   sudo bash install_arch.sh --no-autostart             stop starting LinuxComm at login
-#   sudo bash install_arch.sh --no-speech                without speech-to-text captions (saves ~110 MB)
+#   sudo bash install_arch.sh --no-speech                without speech to text (captions) and text to speech
+#   sudo bash install_arch.sh --no-coqui                 without Coqui TTS's natural voices (saves ~2 GB)
 set -euo pipefail
 
 APP_ID=io.github.itoleck.LinuxComm
@@ -20,13 +21,15 @@ source "$SRC/data/installer-common.sh"
 autostart=keep
 exec_args=""
 speech=1
+coqui=1
 for arg in "$@"; do
   case "$arg" in
     --autostart) autostart=on ;;
     --no-autostart) autostart=off ;;
     --fullscreen) exec_args=" --fullscreen" ;;
     --no-speech) speech=0 ;;
-    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --no-coqui) coqui=0 ;;
+    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -54,6 +57,10 @@ PACKAGES=(
 )
 if ((speech)); then
   PACKAGES+=(python-cffi)  # for Vosk, installed below
+  PACKAGES+=(espeak-ng)    # the eSpeak voices, and the pronunciation for Coqui's
+  if ((coqui)) && [[ $(uname -m) == aarch64 ]]; then
+    PACKAGES+=(gcc)        # one of Coqui's parts has to be compiled on 64-bit ARM
+  fi
 fi
 # PipeWire's own GStreamer plugin, used if PipeWire's PulseAudio layer (pipewire-pulse) is missing.
 if pacman -Q pipewire >/dev/null 2>&1; then
@@ -76,6 +83,12 @@ if ((${#missing[@]})); then
   fi
 else
   echo "    all present"
+fi
+# Optional: echo cancellation uses GStreamer's webrtcdsp, part of gst-plugins-bad.
+if ! pacman -Q gst-plugins-bad >/dev/null 2>&1; then
+  echo "==> Adding GStreamer's extra plugins (for echo cancellation)"
+  pacman -S --needed --noconfirm gst-plugins-bad >/dev/null 2>&1 \
+    || echo "    not available; LinuxComm works without echo cancellation"
 fi
 
 echo "==> Installing LinuxComm to $PREFIX"
@@ -105,6 +118,10 @@ fi
 if ((speech)); then
   setup_speech "$PREFIX" || echo "    Could not set up speech to text (no internet?). LinuxComm works" \
                                   "without captions; run the installer again to add them."
+  if [[ -x $PREFIX/venv/bin/python3 ]]; then
+    setup_voices "$PREFIX" "$coqui" || echo "    Could not set up text to speech (no internet?); run the" \
+                                            "installer again to add the synthetic voices."
+  fi
 else
   remove_speech "$PREFIX"
 fi

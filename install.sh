@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# LinuxComm installer for Ubuntu 23.04+, Debian 12+ and Raspberry Pi OS Bookworm or newer.
+# LinuxComm installer for Ubuntu 23.04+, Debian 12+ and Raspberry Pi OS Bookworm or Trixie.
 #
 #   sudo bash install.sh                            install or update
 #   sudo bash install.sh --autostart                ...and start LinuxComm when anyone logs in
 #   sudo bash install.sh --autostart --fullscreen   ...fullscreen, for wall-mounted displays
 #   sudo bash install.sh --no-autostart             stop starting LinuxComm at login
-#   sudo bash install.sh --no-speech                without speech-to-text captions (saves ~110 MB)
+#   sudo bash install.sh --no-speech                without speech to text (captions) and text to speech
+#   sudo bash install.sh --no-coqui                 without Coqui TTS's natural voices (saves ~2 GB)
 set -euo pipefail
 
 APP_ID=io.github.itoleck.LinuxComm
@@ -19,13 +20,15 @@ source "$SRC/data/installer-common.sh"
 autostart=keep
 exec_args=""
 speech=1
+coqui=1
 for arg in "$@"; do
   case "$arg" in
     --autostart) autostart=on ;;
     --no-autostart) autostart=off ;;
     --fullscreen) exec_args=" --fullscreen" ;;
     --no-speech) speech=0 ;;
-    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --no-coqui) coqui=0 ;;
+    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -44,6 +47,10 @@ PACKAGES=(
 )
 if ((speech)); then
   PACKAGES+=(python3-venv python3-cffi)  # for Vosk, installed below
+  PACKAGES+=(espeak-ng)                  # the eSpeak voices, and the pronunciation for Coqui's
+  if ((coqui)) && [[ $(uname -m) == aarch64 ]]; then
+    PACKAGES+=(gcc libc6-dev python3-dev)  # one of Coqui's parts has to be compiled on 64-bit ARM
+  fi
 fi
 
 is_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"; }
@@ -63,6 +70,13 @@ if ! is_installed gstreamer1.0-pipewire; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gstreamer1.0-pipewire \
     >/dev/null 2>&1 || true
 fi
+# Optional: echo cancellation uses GStreamer's webrtcdsp from the "bad" plugins (Debian 12 and 13,
+# Raspberry Pi OS Bookworm and Trixie, and Ubuntu 25.10+ have it; Ubuntu 24.04's package leaves it out).
+if ! is_installed gstreamer1.0-plugins-bad; then
+  echo "==> Adding GStreamer's extra plugins (for echo cancellation)"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gstreamer1.0-plugins-bad \
+    >/dev/null 2>&1 || echo "    not available; LinuxComm works without echo cancellation"
+fi
 # Optional: weather symbols fall back to emoji when the icon theme has no weather icons.
 if ! fc-list : family 2>/dev/null | grep -i emoji >/dev/null; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends fonts-noto-color-emoji \
@@ -75,7 +89,7 @@ gtk_version=$(dpkg-query -W -f='${Version}\n' libgtk-4-1 2>/dev/null | head -n1 
 if ! dpkg --compare-versions "${adw_version:-0}" ge 1.2 || ! dpkg --compare-versions "${gtk_version:-0}" ge 4.8; then
   echo "LinuxComm needs libadwaita 1.2 and GTK 4.8 or newer, but this system has" >&2
   echo "libadwaita ${adw_version:-(none)} and GTK ${gtk_version:-(none)}." >&2
-  echo "Supported: Ubuntu 23.04+, Debian 12+ and Raspberry Pi OS Bookworm or newer." >&2
+  echo "Supported: Ubuntu 23.04+, Debian 12+ and Raspberry Pi OS Bookworm or Trixie." >&2
   exit 1
 fi
 echo "    libadwaita $adw_version, GTK $gtk_version"
@@ -97,6 +111,10 @@ update-desktop-database -q /usr/share/applications 2>/dev/null || true
 if ((speech)); then
   setup_speech "$PREFIX" || echo "    Could not set up speech to text (no internet?). LinuxComm works" \
                                   "without captions; run the installer again to add them."
+  if [[ -x $PREFIX/venv/bin/python3 ]]; then
+    setup_voices "$PREFIX" "$coqui" || echo "    Could not set up text to speech (no internet?); run the" \
+                                            "installer again to add the synthetic voices."
+  fi
 else
   remove_speech "$PREFIX"
 fi

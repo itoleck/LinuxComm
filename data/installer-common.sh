@@ -56,6 +56,95 @@ PY
   fi
 }
 
+# Text to speech, for talking with a synthetic voice: pyttsx3 with eSpeak NG voices (small)
+# always, and Coqui TTS's natural voices where the computer can run them (64-bit, 4 GB of
+# memory). The Coqui versions are pinned to ones tested together: newer transformers and
+# PyTorch releases have broken coqui-tts before.
+COQUI_PACKAGES=("coqui-tts==0.27.5" "transformers>=4.57,<5" "torch<2.15" "torchaudio<2.12" "torchcodec<0.17")
+
+setup_voices() {
+  local prefix=$1 coqui=$2 venv=$1/venv
+  echo "==> Text to speech (talking with a synthetic voice)"
+  if "$venv/bin/python3" -c 'import pyttsx3' 2>/dev/null; then
+    echo "    pyttsx3 (eSpeak voices) is installed"
+  else
+    echo "    installing pyttsx3 (eSpeak voices)"
+    "$venv/bin/python3" -m pip install --quiet --disable-pip-version-check pyttsx3 || return 1
+  fi
+  save_voice_list "$prefix" pyttsx3 || echo "    the eSpeak voices don't work; is espeak-ng installed?"
+  if ((coqui)); then
+    setup_coqui "$prefix"
+  else
+    remove_coqui "$prefix"
+  fi
+}
+
+setup_coqui() {
+  local prefix=$1 venv=$1/venv arch mem_kb free_kb
+  arch=$(uname -m)
+  mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+  if [[ $arch != x86_64 && $arch != aarch64 ]]; then
+    echo "    natural voices (Coqui TTS) need a 64-bit system; LinuxComm uses the eSpeak voices"
+    return 0
+  fi
+  if ((mem_kb < 3500000)); then
+    echo "    natural voices (Coqui TTS) need 4 GB of memory; LinuxComm uses the eSpeak voices"
+    return 0
+  fi
+  if "$venv/bin/python3" -c 'import importlib.metadata as m; assert m.version("coqui-tts") == "0.27.5"' 2>/dev/null; then
+    echo "    natural voices (Coqui TTS) are installed"
+  else
+    free_kb=$(df -Pk "$prefix" | awk 'NR == 2 {print $4}')
+    if ((free_kb < 4000000)); then
+      echo "    natural voices (Coqui TTS) need 4 GB of free disk space; LinuxComm uses the eSpeak voices"
+      return 0
+    fi
+    echo "    installing natural voices (Coqui TTS: about 1 GB to download, a few minutes)"
+    local index=()
+    if [[ $arch == x86_64 ]]; then
+      index=(--extra-index-url https://download.pytorch.org/whl/cpu)  # PyTorch without the CUDA gigabytes
+    fi
+    if ! "$venv/bin/python3" -m pip install --quiet --disable-pip-version-check \
+         ${index[@]+"${index[@]}"} "${COQUI_PACKAGES[@]}"; then
+      echo "    Coqui TTS could not be installed; LinuxComm uses the eSpeak voices"
+      return 0
+    fi
+  fi
+  echo "    preparing the natural voices (a 150 MB download the first time)"
+  save_voice_list "$prefix" coqui \
+    || echo "    the natural voices didn't start (see $prefix/models/tts-coqui.log); LinuxComm uses the eSpeak voices"
+}
+
+# Start a text-to-speech engine once (Coqui: downloads its model) and save its list of voices,
+# so Preferences can show them without starting the engine.
+save_voice_list() {
+  local prefix=$1 engine=$2 out
+  mkdir -p "$prefix/models"
+  out=$(PYTHONPATH="$prefix" "$prefix/venv/bin/python3" -m linuxcomm.tts_worker "$engine" \
+          --models "$prefix/models" --prepare 2>"$prefix/models/tts-$engine.log") || true
+  if [[ $out == *'"ready": true'* ]]; then
+    printf '%s\n' "$out" > "$prefix/models/voices-$engine.json"
+    return 0
+  fi
+  rm -f "$prefix/models/voices-$engine.json"
+  return 1
+}
+
+remove_coqui() {
+  local prefix=$1 venv=$1/venv
+  rm -rf "$prefix/models/coqui" "$prefix/models/voices-coqui.json" "$prefix/models/tts-coqui.log"
+  if "$venv/bin/python3" -m pip show coqui-tts >/dev/null 2>&1; then
+    # Coqui brings in dozens of packages; rebuilding the environment without it frees them all.
+    echo "    removing the natural voices (Coqui TTS)"
+    rm -rf "$venv"
+    if ! python3 -m venv --system-site-packages "$venv" \
+       || ! "$venv/bin/python3" -m pip install --quiet --disable-pip-version-check vosk pyttsx3; then
+      rm -rf "$venv"
+      return 1
+    fi
+  fi
+}
+
 # Version 0.0.8 created /data for saved transcripts; they now go to ~/linuxcomm/data.
 # Remove that /data if it is still empty; never touch one with files in it.
 remove_old_data_folder() {

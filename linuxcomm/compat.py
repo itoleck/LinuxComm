@@ -15,7 +15,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, GLib, GObject, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, GLib, GObject, Gtk, Pango  # noqa: E402
 
 ADW_VERSION = (Adw.get_major_version(), Adw.get_minor_version())
 GTK_VERSION = (Gtk.get_major_version(), Gtk.get_minor_version())
@@ -223,6 +223,40 @@ def font_family_button(family: str, on_changed: Callable[[str], None]) -> Gtk.Wi
         button.connect("font-set",
                        lambda b: on_changed(Pango.FontDescription.from_string(b.get_font() or "").get_family() or ""))
     return button
+
+
+def color_button(color: str, title: str, on_changed: Callable[[str], None]) -> tuple[Gtk.Widget, Callable[[str], None]]:
+    """A swatch that opens a color picker and calls on_changed("#rrggbb").
+
+    Returns the button and a function that shows another color without calling on_changed.
+    """
+    def to_hex(rgba: Gdk.RGBA) -> str:
+        return "#" + "".join(f"{round(max(0.0, min(1.0, c)) * 255):02x}" for c in (rgba.red, rgba.green, rgba.blue))
+
+    def rgba_of(hex_color: str) -> Gdk.RGBA:
+        rgba = Gdk.RGBA()
+        rgba.parse(hex_color)
+        return rgba
+
+    syncing = [False]
+    if hasattr(Gtk, "ColorDialogButton"):  # GTK 4.10+
+        button = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(title=title, with_alpha=False),
+                                       valign=Gtk.Align.CENTER, tooltip_text="Pick a color")
+        button.set_rgba(rgba_of(color))
+        button.connect("notify::rgba", lambda b, _p: syncing[0] or on_changed(to_hex(b.get_rgba())))
+    else:
+        button = Gtk.ColorButton.new_with_rgba(rgba_of(color))
+        button.set_properties(title=title, use_alpha=False, valign=Gtk.Align.CENTER, tooltip_text="Pick a color")
+        button.connect("color-set", lambda b: on_changed(to_hex(b.get_rgba())))  # not emitted by set_rgba
+
+    def show(hex_color: str) -> None:
+        syncing[0] = True
+        try:
+            button.set_rgba(rgba_of(hex_color))
+        finally:
+            syncing[0] = False
+
+    return button, show
 
 
 def about_dialog(**properties):

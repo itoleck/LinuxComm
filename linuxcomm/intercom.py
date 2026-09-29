@@ -5,7 +5,9 @@ Every LinuxComm station runs a small HTTP server (port 80 by default):
     GET  /linuxcomm/             human-readable status page (handy for testing from a browser)
     GET  /linuxcomm/api/status   JSON describing the station: name, do-not-disturb, ...
     POST /linuxcomm/api/ring     "may I talk to you?" – checks the network key and do-not-disturb
-    POST /linuxcomm/api/talk     live audio: a chunked request body of raw PCM, played as it arrives
+    POST /linuxcomm/api/talk     live audio: a chunked request body of raw PCM, played as it arrives.
+                                 The receiver can hang up early: it then answers 409 with
+                                 {"hangup": "hangup" | "reply"} before the body ends.
 
 The /linuxcomm prefix lets a station sit behind a reverse proxy (see README.md for nginx).
 Stations before version 0.0.6 used the same paths without the prefix; those are still
@@ -31,13 +33,14 @@ import logging
 import os
 import queue
 import re
+import select
 import socket
 import socketserver
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Iterator, Protocol
 from urllib.parse import quote, unquote, urlsplit
@@ -66,12 +69,14 @@ AUTH_WINDOW_S = 300          # tolerated clock difference between stations
 CONNECT_TIMEOUT_S = 3.0
 STREAM_TIMEOUT_S = 10.0      # silence on a live stream before it is considered dead
 MAX_CHUNK = 256 * 1024
+HANGUP_DRAIN_S = 2.0         # after hanging up, how long the caller gets to read the answer
 SEND_QUEUE_CHUNKS = 200      # ~2 s of audio per peer before the oldest is dropped
 
 # Peer states reported by PeerMonitor
 ONLINE, DND, OFFLINE, FOREIGN, SELF, UNKNOWN = "online", "dnd", "offline", "foreign", "self", "unknown"
 # Per-peer states reported while talking
 CONNECTING, LIVE, REFUSED, FAILED, ENDED = "connecting", "live", "refused", "failed", "ended"
+HUNG_UP = "hung-up"          # the station hung up; the detail says why: "hangup" or "reply"
 
 
 # -- helpers ----------------------------------------------------------------------
@@ -172,6 +177,18 @@ class IncomingCall:
     address: str        # the caller's IP address
     broadcast: bool     # sent to every station rather than just this one
     started: float
+    hangup_reason: str = ""   # "hangup" or "reply" once hung up
+    _hung_up: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+
+    def hang_up(self, reason: str = "hangup") -> None:
+        """End this call: its audio stops playing and the caller is told why (from any thread)."""
+        if not self._hung_up.is_set():
+            self.hangup_reason = reason
+            self._hung_up.set()
+
+    @property
+    def hung_up(self) -> bool:
+        return self._hung_up.is_set()
 
 
 class AudioSink(Protocol):
@@ -193,6 +210,8 @@ class StationDelegate(Protocol):
     def alarms(self) -> dict: ...
     def set_alarm(self, slot: int, time: str, enabled: bool, caller: str) -> dict: ...
     def delete_alarm(self, slot: int, caller: str) -> dict: ...
+    # A text message from another station (ValueError = refused)
+    def receive_text(self, caller: str, address: str, text: str) -> None: ...
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -318,6 +337,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         route = self._route()
+        if route == "/api/text":
+            self._text_request()
+            return
         if route not in ("/api/ring", "/api/talk"):
             self.close_connection = True
             self._send_json(404, {"ok": False, "reason": "Not found"})
@@ -339,6 +361,27 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._receive_audio(caller)
 
+    def _text_request(self) -> None:
+        """POST /api/text {"text": "..."}: a text message for this station's screen."""
+        delegate = self.server.delegate
+        caller = unquote(self.headers.get(H_STATION, "")).strip()[:64] or self._client_ip()
+        reason = check_auth(delegate.network_key(), caller, self.headers.get(H_AUTH))
+        status = 403
+        if reason is None and delegate.do_not_disturb():
+            reason, status = "Do not disturb is on", 409
+        if reason:
+            self.close_connection = True
+            self._send_json(status, {"ok": False, "reason": reason})
+            return
+        try:
+            data = json.loads(b"".join(self._iter_body())[:65536] or b"null")
+            text = clean_text(data.get("text") if isinstance(data, dict) else None)
+            delegate.receive_text(caller, self._client_ip(), text)
+        except ValueError as e:  # includes bad JSON
+            self._send_json(400, {"ok": False, "reason": str(e)})
+        else:
+            self._send_json(200, {"ok": True})
+
     def _receive_audio(self, caller: str) -> None:
         delegate = self.server.delegate
         call = IncomingCall(
@@ -359,8 +402,11 @@ class _Handler(BaseHTTPRequestHandler):
         completed = False
         try:
             for chunk in self._iter_body():
+                if call.hung_up:
+                    break
                 sink.write(chunk)
-            completed = True
+            else:
+                completed = True
         except (OSError, ValueError) as e:
             log.info("Stream from %s ended abnormally: %s", caller, e)
         finally:
@@ -369,10 +415,31 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception:
                 log.exception("Error closing playback")
             delegate.incoming_finished(call)
-        if completed:
+        if call.hung_up and not completed:
+            log.info("Hung up on %s (%s)", caller, call.hangup_reason)
+            self.close_connection = True
+            reason = "Replying to you" if call.hangup_reason == "reply" else "Hung up"
+            self._send_json(409, {"ok": False, "hangup": call.hangup_reason, "reason": reason})
+            self._drain(HANGUP_DRAIN_S)
+        elif completed:
             self._send_json(200, {"ok": True})
         else:
             self.close_connection = True
+
+    def _drain(self, seconds: float) -> None:
+        """Discard the rest of the caller's audio until it reads our answer and closes the connection.
+
+        Closing straight away, with its audio still arriving, would reset the connection and
+        could lose the answer.
+        """
+        with contextlib.suppress(OSError):
+            self.connection.shutdown(socket.SHUT_WR)
+        deadline = time.monotonic() + seconds
+        with contextlib.suppress(OSError, ValueError):
+            while (left := deadline - time.monotonic()) > 0:
+                self.connection.settimeout(left)
+                if not self.rfile.read1(65536):
+                    break
 
     def _iter_body(self) -> Iterator[bytes]:
         if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
@@ -588,6 +655,10 @@ def _refusal(resp: http.client.HTTPResponse, payload: dict) -> str:
 
 # -- another station's alarms -------------------------------------------------------------
 
+class _HungUp(Exception):
+    """The station hung up on us while we were talking; args[0] is "hangup" or "reply"."""
+
+
 class RemoteError(Exception):
     """A request to another station failed; str() is a message for the user."""
 
@@ -629,6 +700,47 @@ def set_remote_alarm(address: str, slot: int, time: str, enabled: bool, station:
 
 def delete_remote_alarm(address: str, slot: int, station: str, key: str) -> dict:
     return _alarms_call(address, "DELETE", f"/api/alarms/{slot}", station, key)
+
+
+# -- text messages ----------------------------------------------------------------------------
+
+MAX_TEXT = 1000  # characters
+
+
+def clean_text(text) -> str:
+    """A text message as it will be shown: control characters removed. ValueError if unusable."""
+    if not isinstance(text, str):
+        raise ValueError("Send the message as text")
+    text = "".join(c for c in text if c in "\n\t" or c.isprintable()).strip()
+    if not text:
+        raise ValueError("The message is empty")
+    if len(text) > MAX_TEXT:
+        raise ValueError(f"The message is longer than {MAX_TEXT} characters")
+    return text
+
+
+def send_text(address: str, text: str, station: str, key: str) -> None:
+    """Show a text message on another station. Raises RemoteError with a message for the user."""
+    try:
+        host, port = parse_address(address)
+        body = json.dumps({"text": clean_text(text)}).encode()
+    except ValueError as e:
+        raise RemoteError(str(e)) from None
+    headers = {H_STATION: quote(station), "User-Agent": USER_AGENT, "Accept": "application/json",
+               "Content-Type": "application/json"}
+    if key:
+        headers[H_AUTH] = make_auth(key, station)
+    conn = http.client.HTTPConnection(host, port, timeout=CONNECT_TIMEOUT_S * 2)
+    try:
+        conn.request("POST", BASE_PATH + "/api/text", body=body, headers=headers)
+        resp = conn.getresponse()
+        payload = _read_json(resp)
+    except (OSError, http.client.HTTPException) as e:
+        raise RemoteError(describe_error(e)) from None
+    finally:
+        conn.close()
+    if resp.status != 200 or not payload.get("ok"):
+        raise RemoteError(_refusal(resp, payload))
 
 
 class _Sender(threading.Thread):
@@ -681,6 +793,8 @@ class _Sender(threading.Thread):
             host, port = parse_address(self.address)
             self._ring(host, port)
             self._stream(host, port)
+        except _HungUp as e:
+            self._report(HUNG_UP, str(e))
         except _Refused as e:
             self._report(REFUSED, str(e))
         except (OSError, http.client.HTTPException, ValueError) as e:
@@ -734,9 +848,14 @@ class _Sender(threading.Thread):
             self._report(LIVE)
             while (payload := self._next_payload()) is not None:
                 conn.send(b"%X\r\n%s\r\n" % (len(payload), payload))
-            conn.send(b"0\r\n\r\n")
+                if select.select([conn.sock], [], [], 0)[0]:
+                    break  # the station answered before we finished: it hung up (or failed)
+            else:
+                conn.send(b"0\r\n\r\n")
             resp = conn.getresponse()
             payload = _read_json(resp)
+            if resp.status != 200 and payload.get("hangup"):
+                raise _HungUp(str(payload["hangup"]))
             if resp.status != 200:
                 raise _Refused(_refusal(resp, payload))
         finally:

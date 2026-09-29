@@ -58,5 +58,32 @@ class ThemeTests(unittest.TestCase):
             self.assertEqual(text.count("{"), text.count("}"))
 
 
+class TextColorTests(unittest.TestCase):
+    def test_hex_colors(self):
+        self.assertEqual(themes.parse_hex("#000000"), "#000000")
+        self.assertEqual(themes.parse_hex(" #1A2B3C "), "#1a2b3c")
+        self.assertEqual(themes.parse_hex("ffffff"), "#ffffff")
+        self.assertEqual(themes.parse_hex("#abc"), "#aabbcc")
+        for bad in ("", "#12345", "#1234567", "black", "#ggg000", None, 0):
+            self.assertIsNone(themes.parse_hex(bad), bad)
+
+    def test_main_choices(self):
+        self.assertEqual(themes.TEXT_COLORS, {"Black": "#000000", "White": "#ffffff"})
+        self.assertEqual(themes.DEFAULT_TEXT_COLOR, "#000000")
+
+    def test_readability_on_the_background(self):
+        classic, dark = themes.THEMES["classic"], themes.THEMES["soft-dark"]
+        self.assertIsNone(themes.text_color_problem("#000000", classic))
+        self.assertIsNone(themes.text_color_problem("#ffffff", dark))
+        self.assertIn("White is easier", themes.text_color_problem("#000000", dark))
+        self.assertIn("Black is easier", themes.text_color_problem("#ffffff", classic))
+        for theme in themes.THEMES.values():  # black suits every light theme
+            if not themes.is_dark(theme):
+                self.assertIsNone(themes.text_color_problem("#000000", theme), theme.name)
+
+    def test_css_only_touches_labels_on_the_background(self):
+        self.assertEqual(themes.text_css("#1a2b3c"), "label.on-background { color: #1a2b3c; opacity: 1; }\n")
+
+
 if __name__ == "__main__":
     unittest.main()

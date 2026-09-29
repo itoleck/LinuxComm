@@ -7,6 +7,7 @@ like "Stop talking" stay red in every theme.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -33,6 +34,10 @@ THEMES: dict[str, Theme] = {
     "lavender": Theme("Lavender", "#FAF5FF", "#FFFFFF", "#7C3AED", "#A78BFA", "#4C1D95", "#6B7280", "#E9D5FF", "#EC4899"),
 }
 DEFAULT_THEME = "classic"
+
+# The text color setting (Preferences → Appearance): any "#rrggbb", with these two as the main choices.
+TEXT_COLORS = {"Black": "#000000", "White": "#ffffff"}
+DEFAULT_TEXT_COLOR = "#000000"
 
 
 def get(key: str) -> Theme:
@@ -76,6 +81,23 @@ def rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r}, {g}, {b}, {alpha})"
 
 
+def parse_hex(text) -> str | None:
+    """An HTML hex color ("#1A2B3C", "1a2b3c" or "#abc") as "#1a2b3c", or None if it isn't one."""
+    match = re.fullmatch(r"#?([0-9a-fA-F]{6}|[0-9a-fA-F]{3})", text.strip()) if isinstance(text, str) else None
+    if not match:
+        return None
+    digits = match.group(1).lower()
+    return "#" + (digits if len(digits) == 6 else "".join(c * 2 for c in digits))
+
+
+def text_color_problem(color: str, t: Theme) -> str | None:
+    """Why `color` is hard to read on theme `t`'s background (below 3:1), or None."""
+    if contrast(color, t.background) >= 3:
+        return None
+    better = max(TEXT_COLORS, key=lambda name: contrast(TEXT_COLORS[name], t.background))
+    return f"Hard to read on the {t.name} background; {better} is easier to read"
+
+
 # -- CSS ---------------------------------------------------------------------------------
 
 def _palette(t: Theme) -> dict[str, str]:
@@ -114,3 +136,10 @@ separator {{ background-color: {t.border}; }}
 .status-dot.live, .status-dot.incoming, .status-dot.connecting {{ background-color: {t.accent}; }}
 """)
     return "\n".join(parts)
+
+
+def text_css(color: str) -> str:
+    """The text color setting: only labels that sit directly on the window background (class
+    on-background), such as the Intercom and Audio devices headings. Buttons, cards and panels keep
+    the theme's colors."""
+    return f"label.on-background {{ color: {color}; opacity: 1; }}\n"

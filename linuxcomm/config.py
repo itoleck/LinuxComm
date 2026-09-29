@@ -11,6 +11,8 @@ import threading
 import uuid
 from pathlib import Path
 
+from . import themes
+
 log = logging.getLogger(__name__)
 
 DEFAULTS: dict = {
@@ -18,6 +20,10 @@ DEFAULTS: dict = {
     "network_key": "",           # empty = accept calls from anyone
     "do_not_disturb": False,
     "chime": True,
+    "feedback_suppression": True,  # notch out howling in the microphone while talking
+    "echo_cancellation": True,     # remove what the speaker plays from the microphone (needs webrtcdsp)
+    "tts_relay": False,            # talk with a synthetic voice: only text-to-speech audio is sent
+    "tts_voice": "",               # "coqui:p225", "pyttsx3:gmw/en-US", ...; empty = the default voice
     "mute_other_apps": True,     # silence other applications while receiving
     "incoming_volume": 100,      # percent
     "input_device": "",          # empty = system default
@@ -28,6 +34,7 @@ DEFAULTS: dict = {
     "location_cache": None,      # {"query", "name", "latitude", "longitude"}
     "units": "celsius",          # or "fahrenheit"
     "theme": "classic",          # see themes.THEMES
+    "text_color": "#000000",     # text in the main window, "#rrggbb"
     "background_image": "",      # a file name in ~/linuxcomm/data/images, or a path; empty = none
     "background_strength": 70,   # percent: how strongly the image shows through the theme's background
     "clock_24h": True,
@@ -81,6 +88,11 @@ class Config:
                     self._data[key] = stored[key]
         if self._data.get("transcript_folder") == "/data":
             self._data["transcript_folder"] = ""  # version 0.0.8's default; now ~/linuxcomm/data
+        color = themes.parse_hex(self._data.get("text_color"))
+        if (isinstance(stored, dict) and "text_color" not in stored
+                and themes.is_dark(themes.get(str(self._data.get("theme"))))):
+            color = themes.TEXT_COLORS["White"]  # before the setting existed, dark themes had light text
+        self._data["text_color"] = color or DEFAULTS["text_color"]
         peers = []
         for p in self._data.get("peers") or []:
             if isinstance(p, dict) and str(p.get("address", "")).strip():

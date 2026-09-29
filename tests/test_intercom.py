@@ -4,6 +4,7 @@ Run with:  python3 -m unittest discover -s tests -v
 """
 
 import http.client
+import json
 import socket
 import sys
 import tempfile
@@ -75,6 +76,9 @@ class FakeStation:
         self._store().delete(slot)
         self.alarm_changes.append((caller, slot, None, None))
         return self.store.to_json()
+
+    def receive_text(self, caller, address, text):
+        self.__dict__.setdefault("texts", []).append((caller, address, text))
 
 
 class Recorder:
@@ -198,6 +202,59 @@ class TalkTests(unittest.TestCase):
             port = s.getsockname()[1]
         states = talk(f"127.0.0.1:{port}", [b"\0\0" * 160])
         self.assertEqual(states[-1][1:], (intercom.FAILED, "LinuxComm is not running there"))
+
+
+class HangUpTests(unittest.TestCase):
+    """The receiving station ends a call while the caller is still talking."""
+
+    def hang_up_during_a_talk(self, reason):
+        station = FakeStation()
+        server, address = start_server(station)
+        self.addCleanup(server.stop)
+        recorder = Recorder()
+        session = intercom.TalkSession([("peer", address)], "Office", "", False, recorder)
+        session.start()
+        stop_feeding = threading.Event()
+
+        def feed():  # like a microphone: 20 ms of audio every 20 ms
+            while not stop_feeding.is_set():
+                session.feed(b"\1\0" * 320)
+                time.sleep(0.02)
+
+        feeder = threading.Thread(target=feed, daemon=True)
+        feeder.start()
+        self.addCleanup(stop_feeding.set)
+        deadline = time.monotonic() + 5
+        while not (station.sinks and station.sinks[0].data) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(station.sinks and station.sinks[0].data, "audio should be arriving")
+        started = time.monotonic()
+        station.calls[0].hang_up(reason)
+        self.assertTrue(station.finished.wait(2), "the call ends on the receiving side")
+        received = len(station.sinks[0].data)
+        session.join(5)   # the sender notices on its own, while audio is still being fed
+        elapsed = time.monotonic() - started
+        stop_feeding.set()
+        return station, recorder.states, received, elapsed
+
+    def test_hang_up(self):
+        station, states, received, elapsed = self.hang_up_during_a_talk("hangup")
+        self.assertEqual(states[-1][1:], (intercom.HUNG_UP, "hangup"))
+        self.assertLess(elapsed, 1.5, "the caller learns about it quickly")
+        self.assertTrue(station.sinks[0].closed)
+        time.sleep(0.2)
+        self.assertEqual(len(station.sinks[0].data), received, "nothing is played after hanging up")
+
+    def test_hang_up_to_reply(self):
+        _, states, _, _ = self.hang_up_during_a_talk("reply")
+        self.assertEqual(states[-1][1:], (intercom.HUNG_UP, "reply"))
+
+    def test_hang_up_is_remembered(self):
+        call = intercom.IncomingCall("id", "Office", "127.0.0.1", False, 0.0)
+        self.assertFalse(call.hung_up)
+        call.hang_up("reply")
+        call.hang_up("hangup")  # the first reason counts
+        self.assertEqual((call.hung_up, call.hangup_reason), (True, "reply"))
 
 
 class PeerStatusTests(unittest.TestCase):
@@ -345,6 +402,43 @@ class RemoteAlarmTests(unittest.TestCase):
     def test_unreachable_station(self):
         with self.assertRaisesRegex(intercom.RemoteError, "not running"):
             intercom.fetch_alarms("127.0.0.1:1", "Office", "")
+
+
+class TextTests(unittest.TestCase):
+    """Text messages between stations."""
+
+    def setUp(self):
+        self.station = FakeStation(name="Kitchen")
+        self.server, self.address = start_server(self.station)
+        self.addCleanup(self.server.stop)
+
+    def test_send(self):
+        intercom.send_text(self.address, "  Dinner is ready!\nCome down.\x07 ", "Office", "")
+        self.assertEqual(self.station.texts, [("Office", "127.0.0.1", "Dinner is ready!\nCome down.")])
+
+    def test_refusals_are_explained(self):
+        for text, message in (("", "empty"), ("   \x00 ", "empty"), ("x" * 1001, "longer than 1000")):
+            with self.assertRaisesRegex(intercom.RemoteError, message):
+                intercom.send_text(self.address, text, "Office", "")
+        self.station.dnd = True
+        with self.assertRaisesRegex(intercom.RemoteError, "Do not disturb"):
+            intercom.send_text(self.address, "Hello", "Office", "")
+        self.station.dnd, self.station.key = False, "s3cret"
+        with self.assertRaisesRegex(intercom.RemoteError, "network key"):
+            intercom.send_text(self.address, "Hello", "Office", "")
+        intercom.send_text(self.address, "Hello", "Office", "s3cret")
+        self.assertEqual(self.station.texts, [("Office", "127.0.0.1", "Hello")])
+
+    def test_server_checks_the_text_too(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=5)
+        conn.request("POST", "/linuxcomm/api/text", body=b'{"text": 42}', headers={intercom.H_STATION: "Office"})
+        resp = conn.getresponse()
+        self.assertEqual((resp.status, json.loads(resp.read())["reason"]), (400, "Send the message as text"))
+        conn.close()
+
+    def test_unreachable_station(self):
+        with self.assertRaisesRegex(intercom.RemoteError, "not running"):
+            intercom.send_text("127.0.0.1:1", "Hello", "Office", "")
 
 
 class ProxyErrorTests(unittest.TestCase):

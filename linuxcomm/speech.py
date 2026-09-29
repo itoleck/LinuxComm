@@ -262,10 +262,12 @@ class SpeechToText:
             self._model, self._model_path = None, None
             self._ready.clear()
 
-    def start_call(self, call_id: str, caller: str, english: bool = True) -> CallTranscriber | None:
+    def start_call(self, call_id: str, caller: str, english: bool = True,
+                   on_result: Callable[[str, str, str, bool], None] | None = None) -> CallTranscriber | None:
+        """Transcribe one audio stream; on_result overrides the engine's callback (e.g. dictation)."""
         if not self.available or self._model_path is None:
             return None
-        return CallTranscriber(self, call_id, caller, english)
+        return CallTranscriber(self, call_id, caller, english, on_result or self._on_result)
 
     def _wait_for_model(self):
         if not self._ready.wait(MODEL_WAIT_S):
@@ -277,12 +279,14 @@ class SpeechToText:
 class CallTranscriber(threading.Thread):
     """Transcribes one incoming call. feed() never blocks the audio."""
 
-    def __init__(self, engine: SpeechToText, call_id: str, caller: str, english: bool):
+    def __init__(self, engine: SpeechToText, call_id: str, caller: str, english: bool,
+                 on_result: Callable[[str, str, str, bool], None]):
         super().__init__(name=f"stt:{caller}", daemon=True)
         self._engine = engine
         self.call_id = call_id
         self.caller = caller
         self._english = english
+        self._on_result = on_result
         max_chunks = QUEUE_SECONDS * 100  # 10 ms chunks
         self._queue: queue.Queue[bytes | None] = queue.Queue(maxsize=max_chunks)
         self._dropped = False
@@ -301,7 +305,7 @@ class CallTranscriber(threading.Thread):
 
     def _emit(self, text: str, final: bool) -> None:
         try:
-            self._engine._on_result(self.call_id, self.caller, tidy(text, self._english) if final else text, final)
+            self._on_result(self.call_id, self.caller, tidy(text, self._english) if final else text, final)
         except Exception:
             log.exception("Caption callback failed")
 

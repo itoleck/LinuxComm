@@ -214,6 +214,18 @@ class EngineTests(unittest.TestCase):
         self.assertIn("bad model", engine.error)
         self.assertFalse(engine.ready)
 
+    def test_a_call_can_have_its_own_callback(self):  # dictation: results don't go to the captions
+        engine = speech.SpeechToText(self.on_result, backend=FakeBackend())
+        engine.load("/models/vosk-model-small-en-us-0.15")
+        mine, done = [], threading.Event()
+        call = engine.start_call("dictation", "Me", on_result=lambda *r: (mine.append(r), r[3] and not r[2]
+                                                                          and done.set()))
+        call.feed(b"hello there. ")
+        call.finish()
+        self.assertTrue(done.wait(5))
+        self.assertIn(("dictation", "Me", "Hello there.", True), mine)
+        self.assertEqual(self.results, [])
+
     def test_without_a_model_there_is_no_transcriber(self):
         engine = speech.SpeechToText(self.on_result, backend=FakeBackend())
         self.assertIsNone(engine.start_call("c1", "Kitchen"))

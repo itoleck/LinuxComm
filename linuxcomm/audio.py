@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import array
+import itertools
 import logging
 import math
+import re
 import sys
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import gi
 
 gi.require_version("Gst", "1.0")
-from gi.repository import Gst  # noqa: E402
+from gi.repository import GLib, Gst  # noqa: E402
 
+from .echo import EchoDelayEstimator, webrtc_finds_delay  # noqa: E402
+from .feedback import FeedbackDetector  # noqa: E402
 from .intercom import BYTES_PER_SECOND, CHANNELS, SAMPLE_RATE  # noqa: E402
 
 Gst.init(None)
@@ -145,6 +150,18 @@ class DeviceRegistry:
                 return element
         raise RuntimeError("No audio output is available" if kind == "sink" else "No microphone is available")
 
+    def make_monitor(self, sink_id: str) -> Gst.Element:
+        """A source recording what an output device ("" = default) plays: its PulseAudio or
+        pipewire-pulse monitor. Used as the reference for echo cancellation."""
+        source = Gst.ElementFactory.make("pulsesrc", None)
+        if source is None:
+            raise RuntimeError("GStreamer's pulsesrc is missing")
+        with self._lock:
+            known = ("sink", sink_id) in self._devices
+        # An unplugged device plays through the default output instead (see make_element).
+        source.set_property("device", f"{sink_id}.monitor" if sink_id and known else "@DEFAULT_MONITOR@")
+        return source
+
 
 def pcm_level(pcm: bytes) -> float:
     """Loudness of an S16LE chunk mapped to 0..1 on a -60..0 dBFS scale."""
@@ -160,20 +177,253 @@ def pcm_level(pcm: bytes) -> float:
     return max(0.0, min(1.0, (20 * math.log10(rms / 32768) + 60) / 60))
 
 
+def resample(pcm: bytes, rate: int) -> bytes:
+    """16-bit mono PCM at `rate` Hz in LinuxComm's 16 kHz (e.g. a synthetic voice at 22050 Hz)."""
+    pcm = pcm[: len(pcm) // 2 * 2]
+    if rate == SAMPLE_RATE or not pcm:
+        return pcm
+    pipeline = Gst.parse_launch(
+        f"appsrc name=src format=time caps=audio/x-raw,format=S16LE,layout=interleaved,rate={rate},channels=1 "
+        f"! audioconvert ! audioresample ! {RAW_CAPS} ! appsink name=sink sync=false")
+    src, sink = pipeline.get_by_name("src"), pipeline.get_by_name("sink")
+    pipeline.set_state(Gst.State.PLAYING)
+    buf = Gst.Buffer.new_wrapped(pcm)
+    buf.pts, buf.duration = 0, len(pcm) // 2 * Gst.SECOND // rate
+    src.emit("push-buffer", buf)
+    src.emit("end-of-stream")
+    out = bytearray()
+    try:
+        while (sample := sink.emit("pull-sample")) is not None:  # None at the end
+            b = sample.get_buffer()
+            out += b.extract_dup(0, b.get_size())
+    finally:
+        pipeline.set_state(Gst.State.NULL)
+    return bytes(out)
+
+
+# -- acoustic feedback suppression --------------------------------------------------
+
+_MAGNITUDES = re.compile(r"magnitude=\(float\)\{([^}]*)\}")
+
+
+def spectrum_magnitudes(structure: Gst.Structure) -> list[float]:
+    """The magnitudes of a "spectrum" message (PyGObject can't read its GstValueList directly)."""
+    match = _MAGNITUDES.search(structure.to_string())
+    return [float(v) for v in match.group(1).split(",")] if match else []
+
+
+class FeedbackSuppressor:
+    """Acoustic feedback suppression for the microphone: notch filters that follow howling.
+
+    A spectrum element watches the outgoing audio; when FeedbackDetector finds howling, one
+    band of an equalizer becomes a narrow notch at that frequency (deeper each time the same
+    howl comes back), up to NOTCHES at once, the oldest being reused. Speech passes unchanged
+    until then. Both elements come with gstreamer1.0-plugins-good.
+    """
+
+    NOTCHES = 8
+    BANDS = 256                        # spectrum resolution: 8000 Hz / 256 = 31 Hz at 16 kHz
+    INTERVAL = 50 * Gst.MSECOND
+    FIRST_GAIN, STEP, MIN_GAIN = -15.0, -6.0, -24.0   # dB
+
+    def __init__(self, enabled: bool = True, on_notch: Callable[[float, float], None] | None = None):
+        self.equalizer = _make("equalizer-nbands")
+        self.spectrum = _make("spectrum")
+        self.equalizer.set_property("num-bands", self.NOTCHES)
+        self._bands = [self.equalizer.get_child_by_index(i) for i in range(self.NOTCHES)]
+        for band in self._bands:
+            band.set_property("type", 0)  # a peak filter: the first and last bands are shelves by default
+            band.set_property("gain", 0.0)
+        for name, value in (("bands", self.BANDS), ("interval", self.INTERVAL), ("threshold", -90),
+                            ("post-messages", True), ("message-magnitude", True), ("message-phase", False)):
+            self.spectrum.set_property(name, value)
+        self._detector = FeedbackDetector(SAMPLE_RATE / 2 / self.BANDS)
+        self._slots: list[tuple[float, float] | None] = [None] * self.NOTCHES   # (freq, gain) per band
+        self._next = 0
+        self._on_notch = on_notch
+        self.enabled = enabled
+
+    @property
+    def elements(self) -> list[Gst.Element]:
+        return [self.equalizer, self.spectrum]
+
+    @property
+    def notches(self) -> list[tuple[float, float]]:
+        """The active notches as (frequency in Hz, gain in dB)."""
+        return [slot for slot in self._slots if slot]
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+        if not enabled:  # let everything through again
+            self._slots = [None] * self.NOTCHES
+            for band in self._bands:
+                band.set_property("gain", 0.0)
+        self._detector.reset()
+
+    def on_spectrum(self, magnitudes: list[float]) -> None:
+        if not self.enabled or not magnitudes:
+            return
+        freq = self._detector.feed(magnitudes)
+        if freq is not None:
+            self._notch(freq)
+
+    def _notch(self, freq: float) -> None:
+        same = next((i for i, slot in enumerate(self._slots)
+                     if slot and abs(slot[0] - freq) <= 1.5 * self._detector.band_hz), None)
+        if same is not None:  # the same howl again: cut deeper
+            index, gain = same, max(self.MIN_GAIN, self._slots[same][1] + self.STEP)
+            freq = self._slots[same][0]
+        else:
+            index = next((i for i, slot in enumerate(self._slots) if slot is None), self._next)
+            self._next = (index + 1) % self.NOTCHES
+            gain = self.FIRST_GAIN
+        self._slots[index] = (freq, gain)
+        band = self._bands[index]
+        band.set_property("freq", freq)
+        band.set_property("bandwidth", max(40.0, freq * 0.05))  # about 1/14 octave
+        band.set_property("gain", gain)
+        log.info("Acoustic feedback at %d Hz: notch filter at %d dB", round(freq), round(gain))
+        if self._on_notch:
+            self._on_notch(freq, gain)
+
+
+# -- acoustic echo cancellation -------------------------------------------------------
+
+class EchoCanceller:
+    """Acoustic echo cancellation for the microphone, with WebRTC audio processing.
+
+    What the speaker plays is recorded from the output device's monitor (so it covers other
+    stations, the chime, and other apps' sound) into a webrtcechoprobe, the "reference". The
+    webrtcdsp in the microphone's pipeline removes that sound from the microphone. The two
+    pipelines share one clock and one base time, so the dsp can line their timestamps up.
+
+    The real delay (the output's buffer, the room, the microphone) depends on the hardware.
+    Current WebRTC audio processing (1.x, AEC3) finds it by itself. The old 0.3 library of
+    Debian 12 / Raspberry Pi OS Bookworm only finds echo within about -20..+40 ms of where it is
+    told to look, so with it an EchoDelayEstimator measures the delay and the reference
+    pipeline's latency is set to match: the probe treats that latency as the time between
+    recording the reference and hearing it. (Doing that with AEC3 stops it cancelling.)
+
+    Needs the webrtcdsp and webrtcechoprobe elements from gstreamer1.0-plugins-bad (Debian 12,
+    Raspberry Pi OS, Ubuntu 25.10+, Arch); Ubuntu 24.04's package leaves them out.
+    start() raises RuntimeError if the reference can't be recorded.
+    """
+
+    WINDOW_BELOW, WINDOW_ABOVE = 20, 40   # ms: echo delays the dsp handles around the latency
+    CHECK_EVERY_NS = Gst.SECOND
+
+    _serial = itertools.count(1)
+
+    @staticmethod
+    def available() -> bool:
+        return all(Gst.ElementFactory.find(name) for name in ("webrtcdsp", "webrtcechoprobe"))
+
+    def __init__(self, reference_source: Gst.Element, label: str = "the speaker"):
+        self.name = f"linuxcomm-echo-reference-{next(self._serial)}"
+        self.label = label
+        self._clock = Gst.SystemClock.obtain()
+        self._base_time = self._clock.get_time()
+        self.reference = Gst.Pipeline.new(None)
+        caps = _make("capsfilter")
+        caps.set_property("caps", Gst.Caps.from_string(RAW_CAPS))  # the dsp needs the probe at its own rate
+        probe = Gst.ElementFactory.make("webrtcechoprobe", self.name)
+        self.dsp = Gst.ElementFactory.make("webrtcdsp", None)
+        if probe is None or self.dsp is None:
+            raise RuntimeError("GStreamer's webrtcdsp is missing (install gstreamer1.0-plugins-bad)")
+        sink = _make("appsink")  # renders in time, like a speaker, and lets us measure the delay
+        sink.set_property("sync", True)
+        sink.set_property("emit-signals", True)
+        sink.set_property("max-buffers", 50)
+        sink.set_property("drop", True)
+        sink.connect("new-sample", self._on_reference)
+        _link_all(self.reference, [reference_source, _make("audioconvert"), _make("audioresample"), caps, probe, sink])
+        self.share_clock(self.reference)
+        self.dsp.set_property("probe", self.name)
+        # Only echo cancellation: no noise suppression or automatic gain, which would change the voice.
+        for name, value in (("echo-cancel", True), ("noise-suppression", False), ("gain-control", False),
+                            ("delay-agnostic", True), ("extended-filter", True)):
+            if self.dsp.find_property(name) is not None:
+                self.dsp.set_property(name, value)
+        self.delay = EchoDelayEstimator()
+        self.latency_ms = 0            # where the dsp looks for echo
+        self.echo_delay_ms: int | None = None
+        self._next_check = 0
+        try:  # the dsp's library is loaded now that the element exists
+            maps = Path("/proc/self/maps").read_text()
+        except OSError:
+            maps = ""
+        self.measures_delay = not webrtc_finds_delay(maps)
+
+    def _on_reference(self, appsink) -> Gst.FlowReturn:
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.EOS
+        buf = sample.get_buffer()
+        if buf.pts != Gst.CLOCK_TIME_NONE:
+            self.delay.add("speaker", buf.pts, buf.extract_dup(0, buf.get_size()))
+        return Gst.FlowReturn.OK
+
+    def on_microphone(self, pts: int, pcm: bytes) -> None:
+        """The microphone after echo cancellation (from the capture's streaming thread)."""
+        if not self.measures_delay or pts == Gst.CLOCK_TIME_NONE:
+            return
+        self.delay.add("microphone", pts, pcm)
+        if pts < self._next_check:
+            return
+        self._next_check = pts + self.CHECK_EVERY_NS
+        found = self.delay.estimate()
+        if found is None:
+            return
+        delay = found[0]
+        # Clear echo left in the microphone means the dsp looks in the wrong place.
+        if not self.latency_ms - self.WINDOW_BELOW <= delay <= self.latency_ms + self.WINDOW_ABOVE:
+            self.echo_delay_ms = delay
+            GLib.idle_add(self._set_latency, max(0, delay - 10))
+
+    def _set_latency(self, ms: int) -> bool:
+        self.latency_ms = ms
+        self.reference.set_latency(ms * Gst.MSECOND)
+        log.info("Echo cancellation: sound from %s comes back into the microphone after about %d ms",
+                 self.label, self.echo_delay_ms)
+        return GLib.SOURCE_REMOVE
+
+    def share_clock(self, pipeline: Gst.Pipeline) -> None:
+        """Run `pipeline` on the reference's clock and base time."""
+        pipeline.use_clock(self._clock)
+        pipeline.set_start_time(Gst.CLOCK_TIME_NONE)
+        pipeline.set_base_time(self._base_time)
+
+    def start(self) -> None:
+        """Start recording the reference; the probe must exist before the microphone starts."""
+        if self.reference.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            msg = self.reference.get_bus().pop_filtered(Gst.MessageType.ERROR)
+            self.stop()
+            raise RuntimeError(msg.parse_error()[0].message if msg else "Could not record the speaker's sound")
+
+    def stop(self) -> None:
+        self.reference.set_state(Gst.State.NULL)
+
+
 class Capture:
     """Records an input device as 16 kHz mono S16LE.
 
     on_data(bytes) and on_level(0..1) run on a GStreamer streaming thread;
-    on_error(message) runs on the GLib main loop.
+    on_error(message) runs on the GLib main loop. With an EchoCanceller (already started)
+    and/or a FeedbackSuppressor, the audio passes through their filters, echo cancellation
+    first; the suppressor is adjusted on the GLib main loop. stop() also stops the canceller.
     """
 
     def __init__(self, source: Gst.Element,
                  on_data: Callable[[bytes], None] | None = None,
                  on_level: Callable[[float], None] | None = None,
-                 on_error: Callable[[str], None] | None = None):
+                 on_error: Callable[[str], None] | None = None,
+                 feedback: FeedbackSuppressor | None = None,
+                 echo: EchoCanceller | None = None):
         self._on_data = on_data
         self._on_level = on_level
         self._on_error = on_error
+        self.feedback = feedback
+        self.echo = echo
         self._pipeline = Gst.Pipeline.new(None)
         caps = _make("capsfilter")
         caps.set_property("caps", Gst.Caps.from_string(RAW_CAPS))
@@ -183,10 +433,15 @@ class Capture:
         sink.set_property("max-buffers", 100)
         sink.set_property("drop", True)
         sink.connect("new-sample", self._on_new_sample)
-        _link_all(self._pipeline, [source, _make("audioconvert"), _make("audioresample"), caps, sink])
+        filters = ([echo.dsp] if echo else []) + (feedback.elements if feedback else [])
+        _link_all(self._pipeline, [source, _make("audioconvert"), _make("audioresample"), caps, *filters, sink])
+        if echo:
+            echo.share_clock(self._pipeline)
         self._bus = self._pipeline.get_bus()
         self._bus.add_signal_watch()
-        self._bus_handler = self._bus.connect("message::error", self._on_bus_error)
+        self._bus_handlers = [self._bus.connect("message::error", self._on_bus_error)]
+        if feedback:
+            self._bus_handlers.append(self._bus.connect("message::element", self._on_element))
 
     def start(self) -> None:
         if self._pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
@@ -196,10 +451,18 @@ class Capture:
 
     def stop(self) -> None:
         self._pipeline.set_state(Gst.State.NULL)
-        if self._bus_handler:
-            self._bus.disconnect(self._bus_handler)
+        if self.echo:
+            self.echo.stop()
+        if self._bus_handlers:
+            for handler in self._bus_handlers:
+                self._bus.disconnect(handler)
             self._bus.remove_signal_watch()
-            self._bus_handler = 0
+            self._bus_handlers = []
+
+    def _on_element(self, _bus, message) -> None:
+        structure = message.get_structure()
+        if self.feedback and structure is not None and structure.get_name() == "spectrum":
+            self.feedback.on_spectrum(spectrum_magnitudes(structure))
 
     def _on_new_sample(self, appsink) -> Gst.FlowReturn:
         sample = appsink.emit("pull-sample")
@@ -208,6 +471,8 @@ class Capture:
         buf = sample.get_buffer()
         pcm = buf.extract_dup(0, buf.get_size())
         try:
+            if self.echo:
+                self.echo.on_microphone(buf.pts, pcm)
             if self._on_data:
                 self._on_data(pcm)
             if self._on_level:
