@@ -20,6 +20,29 @@ EOF
   chmod 755 /usr/local/bin/linuxcomm
 }
 
+# pip install into the private Python environment ($1). On 64-bit systems PyPI has every wheel
+# LinuxComm needs, so pip's configuration files are skipped: Raspberry Pi OS adds the piwheels index
+# there (/etc/pip.conf), which only has 32-bit ARM wheels. It adds nothing on 64-bit, slows pip down,
+# and makes it warn about very old files with oddly formatted names (an error in future pip versions).
+#
+# pip also keeps each download in temporary files while it installs (PyTorch alone is ~500 MB).
+# Debian 13 / Raspberry Pi OS Trixie and Ubuntu keep /tmp in memory, half the RAM at most, which a
+# Pi runs out of ("[Errno 28] No space left on device" with plenty of disk space), so its temporary
+# files go next to the environment, on the disk. --no-cache-dir: pip's download cache would keep a
+# second copy of each download in /tmp while installing, and another ~1 GB in root's home.
+venv_pip_install() {
+  local venv=$1 tmp status=0
+  shift
+  tmp=$(mktemp -d "$venv.pip-tmp.XXXXXX") || return 1
+  local pip=("$venv/bin/python3" -m pip install --quiet --disable-pip-version-check --no-cache-dir)
+  case $(uname -m) in
+    x86_64 | aarch64) TMPDIR=$tmp PIP_CONFIG_FILE=/dev/null "${pip[@]}" "$@" || status=$? ;;
+    *) TMPDIR=$tmp "${pip[@]}" "$@" || status=$? ;;
+  esac
+  rm -rf "$tmp"
+  return $status
+}
+
 # Speech to text: Vosk in a private Python environment (the distributions don't package
 # it) that also sees the system's GTK bindings, plus a small English model (~40 MB).
 setup_speech() {
@@ -36,7 +59,7 @@ setup_speech() {
     echo "    installing Vosk"
     rm -rf "$venv"
     if ! python3 -m venv --system-site-packages "$venv" \
-       || ! "$venv/bin/python3" -m pip install --quiet --disable-pip-version-check vosk; then
+       || ! venv_pip_install "$venv" vosk; then
       rm -rf "$venv"  # don't leave a half-made environment behind
       return 1
     fi
@@ -45,10 +68,11 @@ setup_speech() {
     echo "    a speech model is installed"
   else
     echo "    downloading the English speech model (about 40 MB)"
+    mkdir -p "$models"
     python3 - "$models" "$VOSK_MODEL_URL" <<'PY' || return 1
 import shutil, sys, tempfile, urllib.request, zipfile
 dest, url = sys.argv[1], sys.argv[2]
-with tempfile.TemporaryFile() as tmp:
+with tempfile.TemporaryFile(dir=dest) as tmp:  # on the disk: /tmp may be a small RAM disk
     with urllib.request.urlopen(url, timeout=60) as response:
         shutil.copyfileobj(response, tmp)
     zipfile.ZipFile(tmp).extractall(dest)
@@ -69,7 +93,7 @@ setup_voices() {
     echo "    pyttsx3 (eSpeak voices) is installed"
   else
     echo "    installing pyttsx3 (eSpeak voices)"
-    "$venv/bin/python3" -m pip install --quiet --disable-pip-version-check pyttsx3 || return 1
+    venv_pip_install "$venv" pyttsx3 || return 1
   fi
   save_voice_list "$prefix" pyttsx3 || echo "    the eSpeak voices don't work; is espeak-ng installed?"
   if ((coqui)); then
@@ -104,7 +128,7 @@ setup_coqui() {
     if [[ $arch == x86_64 ]]; then
       index=(--extra-index-url https://download.pytorch.org/whl/cpu)  # PyTorch without the CUDA gigabytes
     fi
-    if ! "$venv/bin/python3" -m pip install --quiet --disable-pip-version-check \
+    if ! venv_pip_install "$venv" \
          ${index[@]+"${index[@]}"} "${COQUI_PACKAGES[@]}"; then
       echo "    Coqui TTS could not be installed; LinuxComm uses the eSpeak voices"
       return 0
@@ -138,7 +162,7 @@ remove_coqui() {
     echo "    removing the natural voices (Coqui TTS)"
     rm -rf "$venv"
     if ! python3 -m venv --system-site-packages "$venv" \
-       || ! "$venv/bin/python3" -m pip install --quiet --disable-pip-version-check vosk pyttsx3; then
+       || ! venv_pip_install "$venv" vosk pyttsx3; then
       rm -rf "$venv"
       return 1
     fi

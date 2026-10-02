@@ -109,7 +109,7 @@ because other applications use them.
 1. Click **+** next to *Intercom* and enter the other station's IP address or host name.
    The window's subtitle shows this station's own IP address. On most home networks,
    `hostname.local` works too. For a station behind a reverse proxy, enter its URL, such as
-   `http://swarmsoft.com/linuxcomm` (see [Behind a reverse proxy](#behind-a-reverse-proxy-nginx)).
+   `http://example.com/linuxcomm` (see [Behind a reverse proxy](#behind-a-reverse-proxy-nginx)).
 2. The dot next to each station shows its status: green = online, orange = do not disturb,
    grey = offline or not running LinuxComm.
 3. Click **Talk** to speak to one station, or **Talk to all stations** to speak to every station.
@@ -471,6 +471,8 @@ then delivers it in one burst.
 | The background image doesn't appear | Check the name under Preferences → *Appearance*; a bare name must be a file in `~/linuxcomm/data/images/`. If the file was moved or deleted, LinuxComm shows the theme's plain background and logs "Background image … not found". |
 | Captions bar says "No speech model is installed" | The model download failed or was deleted. Run the installer again, or add a model as described in [Captions](#captions-speech-to-text). |
 | The **Talk** buttons are greyed out | Another station is talking to you. Press **Reply** to answer it, or **Hang Up**, or wait until it finishes. |
+| The installer fails with `[Errno 28] No space left on device`, although the disk has room | Fixed in 0.0.26: pip kept its downloads in `/tmp`, which Debian 13 / Raspberry Pi OS Trixie and Ubuntu keep in memory (at most half the RAM). Update this folder and run the installer again. |
+| The installer shows `DEPRECATION: Wheel filename '...' is not correctly normalised` | pip warns about very old files on piwheels, the extra package index Raspberry Pi OS sets up in `/etc/pip.conf`. It is harmless; since 0.0.25 the installer doesn't use piwheels on 64-bit systems (it only has 32-bit ARM packages), so the warning only remains possible on 32-bit Raspberry Pi OS. |
 | Echo or feedback | Stations near each other pick up each other's speakers. Keep *Acoustic feedback suppression* and *Echo cancellation* on (Preferences → *Talking*), and use headsets or lower the incoming volume if it still happens. |
 | *Text-to-speech voice* is greyed out | Speech to text isn't installed. Run the installer again (with an internet connection, and without `--no-speech`). |
 | Only eSpeak voices, no natural (Coqui) voices | The installer only adds them on 64-bit systems with 4 GB of memory and disk space, and says why it didn't. If they are installed but don't start, LinuxComm says so; see `~/.local/state/linuxcomm/tts-coqui.log`. |

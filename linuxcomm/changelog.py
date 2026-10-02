@@ -10,6 +10,17 @@ from html import escape
 
 # (version, date, changes)
 RELEASES: list[tuple[str, str, list[str]]] = [
+    ("0.0.26", "2026-10-01", [
+        "Installer: fixed \"[Errno 28] No space left on device\" while installing the voices on Raspberry Pi "
+        "OS Trixie, even with plenty of disk space. pip kept its downloads (PyTorch alone is ~500 MB) in /tmp, "
+        "which Debian 13 keeps in memory; they now go to the disk next to LinuxComm's environment.",
+        "pip no longer keeps a cached copy of the downloads, which saves about 1 GB of disk space.",
+    ]),
+    ("0.0.25", "2026-10-01", [
+        "Installer: on 64-bit systems, pip no longer looks at the piwheels index that Raspberry Pi OS adds "
+        "(it only has 32-bit ARM packages). That removes a flood of \"Wheel filename ... is not correctly "
+        "normalised\" warnings about very old files there, and makes installing the voices faster.",
+    ]),
     ("0.0.24", "2026-09-28", [
         "While you record a message for the synthetic voice, the station's Talk button reads Send (and Talk "
         "to all stations reads Send to all stations): press it to send the message.",
